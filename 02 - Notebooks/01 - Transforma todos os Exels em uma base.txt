@@ -1,0 +1,91 @@
+import re
+import pandas as pd
+from datetime import datetime, date
+from pathlib import Path
+
+DATA_INI = date(2025, 10, 1)
+DATA_FIM = date(2025, 12, 30)
+
+# =========================
+# Helpers
+# =========================
+def extrair_data_do_nome(nome_arquivo):
+    m = re.search(r"PRE(\d{8})", nome_arquivo)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y%m%d").date()
+
+def parse_taxa_252(valor):
+    if pd.isna(valor):
+        return None
+
+    s = str(valor).strip()
+    s = re.sub(r"[^\d,\.]", "", s)
+
+    if s == "":
+        return None
+
+    # casos com separador decimal
+    if "," in s or "." in s:
+        s = s.replace(".", "").replace(",", ".") if s.count(",") == 1 else s.replace(",", ".")
+        try:
+            return float(s)
+        except:
+            return None
+
+    # caso inteiro tipo "1490" -> 14.90
+    try:
+        return int(s) / 100
+    except:
+        return None
+
+def ler_pre_xls_html(caminho):
+    df = pd.read_html(caminho)[0]
+
+    # remove cabeçalhos duplicados
+    df = df.iloc[2:].copy()
+    df.columns = ["dias_col", "taxa_252_col", "taxa_360_col"]
+
+    df["dias_col"] = pd.to_numeric(df["dias_col"], errors="coerce")
+    df["taxa_252_col"] = df["taxa_252_col"].apply(parse_taxa_252)
+
+    df = df[["dias_col", "taxa_252_col"]].dropna(subset=["dias_col"])
+
+    df = df.rename(columns={
+        "dias_col": "dias_uteis",
+        "taxa_252_col": "taxa_252"
+    })
+
+    return df.reset_index(drop=True)
+
+# =========================
+# Leitura de todos os PRE*.xls
+# =========================
+linhas = []
+
+for arq in Path(".").glob("PRE*.xls"):
+    data_curva = extrair_data_do_nome(arq.name)
+
+    if data_curva is None:
+        continue
+
+    if not (DATA_INI <= data_curva <= DATA_FIM):
+        continue
+
+    df_dia = ler_pre_xls_html(arq)
+    df_dia.insert(0, "data_curva", data_curva.strftime("%d/%m/%Y"))
+    linhas.append(df_dia)
+
+df_curvas = (
+    pd.concat(linhas, ignore_index=True)
+      .sort_values(["data_curva", "dias_uteis"])
+      .reset_index(drop=True)
+)
+
+df_curvas.head()
+
+df_curvas.to_csv(
+"curva_pre_20251001_20251230.csv",
+index=False,
+encoding="utf-8-sig"
+)

@@ -1,0 +1,364 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.interpolate import CubicSpline, BSpline
+from scipy.optimize import minimize
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+DU_PATH = "DU.xlsx"   # ajuste se necessário
+
+TRAIN_FRAC = 0.70
+SEED_SPLIT = 123
+
+# Monte Carlo
+USE_MONTE_CARLO = True
+N_SIM = 300          # aumente (ex.: 1000, 5000, 10000) se tiver tempo/máquina - (na minha foi 300, no trabalho explico a escolha)
+SIGMA_BP = 1.0       # ruído em bps nos 41 pontos (1 bp = 0.01%)
+SEED_MC = 777
+
+# B-Spline ridge
+BS_INTERNAL_KNOTS = 6
+BS_RIDGE = 1e-8
+BS_DEGREE = 3
+
+# GA→NSS (mais leve por padrão; aumente se quiser)
+GA_SEED = 2024
+GA_POP_SIZE = 40
+GA_GENER = 80
+GA_ELITE_FRAC = 0.15
+GA_MUT_SIGMA = 0.10   # escala em % (igual seu script)
+
+# Métricas
+EPS = 1e-12
+
+# ==========================================================
+# 1) Ler DUs (41 pontos) e preparar base diária completa
+# ==========================================================
+df_du = pd.read_excel(DU_PATH)
+df_du = df_du.rename(columns=lambda x: x.strip())
+DUS = sorted(df_du["DU"].dropna().astype(int).unique())
+
+# df_curvas precisa existir: colunas ["data_curva","dias_uteis","taxa_252"]
+df_curvas["dias_uteis"] = df_curvas["dias_uteis"].astype(int)
+df_curvas["taxa_252"] = pd.to_numeric(df_curvas["taxa_252"], errors="coerce")
+
+# data em datetime
+df_curvas["data_dt"] = pd.to_datetime(df_curvas["data_curva"], format="%d/%m/%Y")
+
+# ==========================================================
+# 2) Funções dos 4 métodos 
+# ==========================================================
+def make_strictly_increasing_xy(x, y, agg="mean"):
+    """
+    Garante x estritamente crescente removendo duplicatas em x.
+    Para x repetido, agrega y (mean ou first).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    df = pd.DataFrame({"x": x, "y": y})
+    if agg == "mean":
+        g = df.groupby("x", as_index=False)["y"].mean()
+    else:
+        g = df.groupby("x", as_index=False)["y"].first()
+
+    x_u = g["x"].to_numpy(dtype=float)
+    y_u = g["y"].to_numpy(dtype=float)
+    return x_u, y_u
+
+def fit_cubic_spline_eval(x_fit, y_fit, x_eval):
+    x_fit, y_fit = make_strictly_increasing_xy(x_fit, y_fit, agg="mean")
+
+    # fallback seguro se sobrar poucos pontos únicos
+    if len(x_fit) < 4:
+        return np.interp(x_eval, x_fit, y_fit)
+
+    cs = CubicSpline(x_fit, y_fit, bc_type="natural", extrapolate=True)
+    return cs(x_eval)
+
+def fit_bspline_ridge_eval(x_fit, y_fit, x_eval, n_internal_knots=6, degree=3, ridge=1e-8):
+    """
+    B-spline cúbica robusta por base + ridge.
+    """
+    x_fit, y_fit = make_strictly_increasing_xy(x_fit, y_fit, agg="mean")
+
+    x_fit = np.asarray(x_fit, dtype=float)
+    y_fit = np.asarray(y_fit, dtype=float)
+    k = degree
+
+    if len(x_fit) < (k + 2):
+        # fallback seguro: linear
+        return np.interp(x_eval, x_fit, y_fit)
+
+    # knots internos uniformes
+    if n_internal_knots > 0:
+        x_internal = np.linspace(x_fit.min(), x_fit.max(), n_internal_knots + 2)[1:-1]
+    else:
+        x_internal = np.array([])
+
+    knots = np.concatenate((np.repeat(x_fit.min(), k+1), x_internal, np.repeat(x_fit.max(), k+1)))
+    n_coef = len(knots) - k - 1
+
+    # design matrix
+    B = np.zeros((len(x_fit), n_coef), dtype=float)
+    for j in range(n_coef):
+        c = np.zeros(n_coef, dtype=float)
+        c[j] = 1.0
+        basis_j = BSpline(knots, c, k, extrapolate=True)
+        B[:, j] = basis_j(x_fit)
+
+    BtB = B.T @ B
+    Bty = B.T @ y_fit
+    coef = np.linalg.solve(BtB + ridge*np.eye(n_coef), Bty)
+
+    spl = BSpline(knots, coef, k, extrapolate=True)
+    return spl(x_eval)
+
+# --------- NSS (em % a.a.) ----------
+def nss_zero(t, theta):
+    b0,b1,b2,b3,t1,t2 = theta
+    t = np.array(t, dtype=float)
+    x = t/np.maximum(t1,1e-8)
+    y = t/np.maximum(t2,1e-8)
+
+    def B1(z):
+        out = np.empty_like(z)
+        small = z < 1e-8
+        out[small] = 1 - z[small]/2 + z[small]**2/6
+        zs = z[~small]
+        out[~small] = (1 - np.exp(-zs))/zs
+        return out
+
+    def B2(z):
+        return B1(z) - np.exp(-z)
+
+    return b0 + b1*B1(x) + b2*B2(x) + b3*B2(y)
+
+def fit_nss_bfgs_eval(t_fit, r_fit, t_eval, theta0=None):
+    if theta0 is None:
+        theta0 = np.array([r_fit[-1], -(r_fit[0]-r_fit[-1]), 0.0, 0.0, 1.5, 7.0], dtype=float)
+
+    bounds = [
+        (0.0, 40.0),
+        (-40.0, 40.0),
+        (-40.0, 40.0),
+        (-40.0, 40.0),
+        (0.05, 30.0),
+        (0.05, 30.0)
+    ]
+
+    def loss(theta):
+        rhat = nss_zero(t_fit, theta)
+        return float(np.mean((rhat - r_fit)**2))
+
+    res = minimize(loss, theta0, method="L-BFGS-B",
+                   bounds=bounds, options=dict(maxiter=1200, ftol=1e-10))
+    return nss_zero(t_eval, res.x), res
+
+# --------- GA→NSS (seed por dia) ----------
+def ga_seed_for_nss(t_fit, r_fit, seed=2024, pop_size=40, generations=80, elite_frac=0.15, mutation_sigma=0.10):
+    rng = np.random.default_rng(seed)
+
+    bounds = np.array([
+        [0.0, 40.0],
+        [-40.0, 40.0],
+        [-40.0, 40.0],
+        [-40.0, 40.0],
+        [0.05, 30.0],
+        [0.05, 30.0]
+    ], dtype=float)
+    lo, hi = bounds[:,0], bounds[:,1]
+
+    def loss(theta, tX, rX):
+        return float(np.mean((nss_zero(tX, theta) - rX)**2))
+
+    base = np.array([r_fit[-1], -(r_fit[0]-r_fit[-1]), 0.0, 0.0, 1.5, 7.0], dtype=float)
+    base = np.clip(base, lo, hi)
+
+    pop = base + rng.normal(0.0, mutation_sigma, size=(pop_size, 6))
+    pop = np.clip(pop, lo, hi)
+
+    elite_n = max(1, int(round(elite_frac * pop_size)))
+
+    for _ in range(generations):
+        scores = np.array([loss(ind, t_fit, r_fit) for ind in pop])
+        elite = pop[np.argsort(scores)[:elite_n]]
+
+        def tournament():
+            a, b = rng.integers(0, pop_size, size=2)
+            return pop[a] if scores[a] < scores[b] else pop[b]
+
+        children = []
+        while len(children) < (pop_size - elite_n):
+            p1, p2 = tournament(), tournament()
+            alpha = rng.random()
+            child = alpha*p1 + (1-alpha)*p2
+            child += rng.normal(0.0, mutation_sigma, size=6)
+            child = np.clip(child, lo, hi)
+            children.append(child)
+
+        pop = np.vstack([elite, np.array(children)])
+
+    scores = np.array([loss(ind, t_fit, r_fit) for ind in pop])
+    theta0_GA = pop[np.argmin(scores)]
+
+    def solver(tX, rX, tEval):
+        r_eval, _ = fit_nss_bfgs_eval(tX, rX, tEval, theta0=theta0_GA)
+        return r_eval
+
+    return solver, theta0_GA
+
+# ==========================================================
+# 3) Utilitários: pegar 41 pontos (com "mais próximo") por dia
+# ==========================================================
+def pontos_41_por_dia(df_dia, dus_alvo):
+    x_all = df_dia["dias_uteis"].to_numpy()
+    y_all = df_dia["taxa_252"].to_numpy()
+
+    x_fit = []
+    y_fit = []
+    for du in dus_alvo:
+        i = np.argmin(np.abs(x_all - du))
+        x_fit.append(int(x_all[i]))
+        y_fit.append(float(y_all[i]))
+
+    # garantir estritamente crescente já aqui (evita duplicatas)
+    x_fit, y_fit = make_strictly_increasing_xy(np.array(x_fit), np.array(y_fit), agg="mean")
+    return np.array(x_fit, dtype=float), np.array(y_fit, dtype=float)
+
+def metricas(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    err = y_pred - y_true
+    rmse = np.sqrt(np.mean(err**2))
+    mae = np.mean(np.abs(err))
+    mape = np.mean(np.abs(err) / np.maximum(np.abs(y_true), EPS)) * 100.0
+    return rmse, mae, mape
+
+# ==========================================================
+# 4) Split treino/teste (70/30) por datas
+# ==========================================================
+datas_unicas = np.array(sorted(df_curvas["data_dt"].unique()))
+rng_split = np.random.default_rng(SEED_SPLIT)
+rng_split.shuffle(datas_unicas)
+
+n_train = int(round(TRAIN_FRAC * len(datas_unicas)))
+datas_train = set(datas_unicas[:n_train])
+datas_test  = set(datas_unicas[n_train:])
+
+# ==========================================================
+# 5) Loop diário + Monte Carlo + avaliação em TODOS os pontos do dia
+# ==========================================================
+rng_mc = np.random.default_rng(SEED_MC)
+sigma_pct = SIGMA_BP * 0.01
+
+rows_metrics = []
+curvas_store = {}
+
+for dt, df_dia in df_curvas.groupby("data_dt"):
+    df_dia = df_dia.sort_values("dias_uteis").dropna(subset=["taxa_252"])
+    if len(df_dia) < 60:
+        continue
+
+    split = "train" if dt in datas_train else "test"
+
+    x_eval = df_dia["dias_uteis"].to_numpy(dtype=float)
+    y_true = df_dia["taxa_252"].to_numpy(dtype=float)
+
+    x_fit_base, y_fit_base = pontos_41_por_dia(df_dia, DUS)
+
+    # NSS em anos
+    t_fit_base = x_fit_base / 252.0
+    t_eval = x_eval / 252.0
+
+    # GA seed 1x por dia (em dados base sem ruído)
+    solver_ga_nss, _ = ga_seed_for_nss(
+        t_fit_base, y_fit_base,
+        seed=GA_SEED,
+        pop_size=GA_POP_SIZE,
+        generations=GA_GENER,
+        elite_frac=GA_ELITE_FRAC,
+        mutation_sigma=GA_MUT_SIGMA
+    )
+
+    pred_acc = {
+        "CubicSpline": np.zeros_like(y_true, dtype=float),
+        "B-Spline (Ridge)": np.zeros_like(y_true, dtype=float),
+        "NSS+L-BFGS-B": np.zeros_like(y_true, dtype=float),
+        "GA→NSS+L-BFGS-B": np.zeros_like(y_true, dtype=float),
+    }
+
+    n_sim_eff = N_SIM if USE_MONTE_CARLO else 1
+
+    for s in range(n_sim_eff):
+        if USE_MONTE_CARLO:
+            y_fit = y_fit_base + rng_mc.normal(0.0, sigma_pct, size=y_fit_base.shape)
+        else:
+            y_fit = y_fit_base
+
+        # garantir monotonicidade também no y_fit ruidoso
+        x_fit, y_fit = make_strictly_increasing_xy(x_fit_base, y_fit, agg="mean")
+
+        # spline / bspline em DU
+        y_cs = fit_cubic_spline_eval(x_fit, y_fit, x_eval)
+        y_bs = fit_bspline_ridge_eval(x_fit, y_fit, x_eval,
+                                      n_internal_knots=BS_INTERNAL_KNOTS,
+                                      degree=BS_DEGREE,
+                                      ridge=BS_RIDGE)
+
+        # NSS / GA-NSS em anos
+        t_fit = x_fit / 252.0
+        y_nss, _ = fit_nss_bfgs_eval(t_fit, y_fit, t_eval, theta0=None)
+        y_ganss = solver_ga_nss(t_fit, y_fit, t_eval)
+
+        pred_acc["CubicSpline"] += y_cs
+        pred_acc["B-Spline (Ridge)"] += y_bs
+        pred_acc["NSS+L-BFGS-B"] += y_nss
+        pred_acc["GA→NSS+L-BFGS-B"] += y_ganss
+
+    for k in pred_acc:
+        pred_acc[k] /= n_sim_eff
+
+    for metodo, y_pred in pred_acc.items():
+        rmse, mae, mape = metricas(y_true, y_pred)
+        rows_metrics.append({
+            "data": dt.strftime("%Y-%m-%d"),
+            "split": split,
+            "metodo": metodo,
+            "RMSE": rmse,
+            "MAE": mae,
+            "MAPE_%": mape
+        })
+
+    if split == "test" and "example_test_day" not in curvas_store:
+        curvas_store["example_test_day"] = dt
+        curvas_store["x_eval"] = x_eval
+        curvas_store["y_true"] = y_true
+        curvas_store["preds"] = pred_acc.copy()
+
+df_metrics = pd.DataFrame(rows_metrics)
+
+tabela_resumo = (
+    df_metrics.groupby(["split","metodo"])
+    .agg(
+        RMSE_medio=("RMSE","mean"),
+        RMSE_dp=("RMSE","std"),
+        MAE_medio=("MAE","mean"),
+        MAE_dp=("MAE","std"),
+        MAPE_medio=("MAPE_%","mean"),
+        MAPE_dp=("MAPE_%","std"),
+    )
+    .reset_index()
+)
+
+for c in ["RMSE_medio","RMSE_dp","MAE_medio","MAE_dp","MAPE_medio","MAPE_dp"]:
+    tabela_resumo[c] = tabela_resumo[c].astype(float).round(4)
+
+tabela_resumo

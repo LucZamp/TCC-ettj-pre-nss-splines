@@ -1,0 +1,453 @@
+# ==========================================================
+# EXTRAPOLAÇÃO + CURVAS MÉDIAS GLOBAIS (MC) + TABELAS/GRÁFICOS
+# - Calibra sempre nos 41 pontos (até DU_CUTOFF=3465)
+# - Avalia e plota até DU = 3717, 3969, 5000
+# - Plota linha vertical vermelha em DU=3465 (início extrapolação)
+# - Gera 3 tabelas (uma por DU alvo) com:
+#   * Est/Obs médio no DU_CUTOFF e no DU alvo
+#   * Viés médio no DU alvo
+#   * RMSE/MAE dia a dia no DU alvo
+# ==========================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =========================
+# CONFIG (AJUSTE AQUI)
+# =========================
+DU_CUTOFF = 3465
+DU_TARGETS = [3717, 3969, 5000]
+
+# DU_MAX precisa ser >= maior DU alvo (e idealmente >= max DU do df_curvas)
+# Se você já define DU_MAX antes, esse bloco respeita.
+try:
+    DU_MAX
+except NameError:
+    DU_MAX = max(DU_TARGETS)
+
+DU_MAX = max(DU_MAX, max(DU_TARGETS))
+
+GRID_MODE = "all_du"   # "all_du" => grid = 1..DU_MAX
+MIN_POINTS_DAY = 60
+EXPORT_CSV = True
+OUT_DIR = "."
+PLOT_SHOW = True
+
+# Monte Carlo
+try:
+    SEED_MC
+except NameError:
+    SEED_MC = 123
+
+try:
+    SIGMA_BP
+except NameError:
+    SIGMA_BP = 0.0  # ex: 1.0 = 1bp; 0 = sem ruído
+
+try:
+    USE_MONTE_CARLO
+except NameError:
+    USE_MONTE_CARLO = True
+
+try:
+    N_SIM
+except NameError:
+    N_SIM = 300
+
+# GA (se seu código já define, ele usa)
+try:
+    GA_SEED
+except NameError:
+    GA_SEED = 123
+
+try:
+    GA_POP_SIZE
+except NameError:
+    GA_POP_SIZE = 40
+
+try:
+    GA_GENER
+except NameError:
+    GA_GENER = 40
+
+try:
+    GA_ELITE_FRAC
+except NameError:
+    GA_ELITE_FRAC = 0.1
+
+try:
+    GA_MUT_SIGMA
+except NameError:
+    GA_MUT_SIGMA = 0.05
+
+# B-spline (se seu código já define, ele usa)
+try:
+    BS_INTERNAL_KNOTS
+except NameError:
+    BS_INTERNAL_KNOTS = 12
+
+try:
+    BS_DEGREE
+except NameError:
+    BS_DEGREE = 3
+
+try:
+    BS_RIDGE
+except NameError:
+    BS_RIDGE = 1e-6
+
+# =========================
+# CHECKS BÁSICOS
+# =========================
+required_cols = {"data_dt", "dias_uteis", "taxa_252"}
+if "df_curvas" not in globals():
+    raise ValueError("df_curvas não está definido no ambiente.")
+if not required_cols.issubset(set(df_curvas.columns)):
+    raise ValueError(f"df_curvas precisa ter colunas {required_cols}. Encontrado: {df_curvas.columns}")
+
+if "DUS" not in globals():
+    raise ValueError("DUS (lista/array com 41 vencimentos-alvo) não está definido no ambiente.")
+
+# =========================
+# GRID COMUM (1..DU_MAX)
+# =========================
+grid_du = np.arange(1, DU_MAX + 1, dtype=float)
+grid_t = grid_du / 252.0
+
+# RNG do Monte Carlo
+rng_mc = np.random.default_rng(SEED_MC)
+sigma_pct = SIGMA_BP * 0.01  # 1 bp = 0.01 em taxa (%)
+
+metodos = [
+    "CubicSpline",
+    "B-Spline (Ridge)",
+    "NSS+L-BFGS-B",
+    "GA→NSS+L-BFGS-B"
+]
+
+# =========================
+# ACUMULADORES GLOBAIS
+# =========================
+sum_global = {m: np.zeros_like(grid_du, dtype=float) for m in metodos}
+sum2_global = {m: np.zeros_like(grid_du, dtype=float) for m in metodos}
+
+# (NOVO) Curva observada global no grid
+sum_obs_global = np.zeros_like(grid_du, dtype=float)
+sum2_obs_global = np.zeros_like(grid_du, dtype=float)
+
+count_days = 0
+
+# Para tabelas por DU: guardar valor por dia no DU alvo e no cutoff
+daily_records = []
+
+# (opcional) curvas médias por dia (long format)
+daily_means = []
+
+# =========================
+# FUNÇÕES AUXILIARES
+# =========================
+def _norm_method_col(m: str) -> str:
+    return (
+        m.replace(" ", "_")
+         .replace("→", "to")
+         .replace("+", "plus")
+         .replace("-", "_")
+    )
+
+def _interp_obs_to_grid(df_dia: pd.DataFrame, grid_du: np.ndarray) -> np.ndarray:
+    """Interpola a curva observada do dia para o grid (1..DU_MAX)."""
+    x_obs = df_dia["dias_uteis"].to_numpy(dtype=float)
+    y_obs = df_dia["taxa_252"].to_numpy(dtype=float)
+
+    # remove duplicatas de DU agregando média
+    df_tmp = pd.DataFrame({"x": x_obs, "y": y_obs}).groupby("x", as_index=False)["y"].mean()
+    x_obs = df_tmp["x"].to_numpy(dtype=float)
+    y_obs = df_tmp["y"].to_numpy(dtype=float)
+
+    # interp linear; fora do range, prende no extremo (np.interp faz isso)
+    return np.interp(grid_du, x_obs, y_obs)
+
+def _val_at_du_from_grid(y_grid: np.ndarray, du: int) -> float:
+    du = int(du)
+    if du < 1 or du > len(y_grid):
+        return float("nan")
+    return float(y_grid[du - 1])
+
+# ==========================================================
+# LOOP POR DIA
+# ==========================================================
+for dt, df_dia in df_curvas.groupby("data_dt"):
+    df_dia = (
+        df_dia.sort_values("dias_uteis")
+              .dropna(subset=["taxa_252"])
+    )
+    if len(df_dia) < MIN_POINTS_DAY:
+        continue
+
+    # ------------------------------------------------------
+    # Curva OBSERVADA do dia no grid (para comparar extrapolação)
+    # ------------------------------------------------------
+    y_obs_grid = _interp_obs_to_grid(df_dia, grid_du)
+    sum_obs_global += y_obs_grid
+    sum2_obs_global += y_obs_grid**2
+
+    # ------------------------------------------------------
+    # 41 pontos base (calibração)
+    # ------------------------------------------------------
+    x_fit_base, y_fit_base = pontos_41_por_dia(df_dia, DUS)
+
+    # GARANTE que você está realmente calibrando só até cutoff:
+    mask_cut = (x_fit_base <= DU_CUTOFF)
+    x_fit_base = x_fit_base[mask_cut]
+    y_fit_base = y_fit_base[mask_cut]
+
+    if len(x_fit_base) < 8:
+        continue
+
+    # ------------------------------------------------------
+    # GA seed (1x por dia)
+    # ------------------------------------------------------
+    solver_ga_nss, _ = ga_seed_for_nss(
+        x_fit_base / 252.0,   # t_fit
+        y_fit_base,           # r_fit
+        seed=GA_SEED,
+        pop_size=GA_POP_SIZE,
+        generations=GA_GENER,
+        elite_frac=GA_ELITE_FRAC,
+        mutation_sigma=GA_MUT_SIGMA
+    )
+
+    # ------------------------------------------------------
+    # Monte Carlo (média por dia)
+    # ------------------------------------------------------
+    acc_day = {m: np.zeros_like(grid_du, dtype=float) for m in metodos}
+    n_sim_eff = N_SIM if USE_MONTE_CARLO else 1
+
+    for _ in range(n_sim_eff):
+        # ruído nos pontos base
+        y_fit = (
+            y_fit_base
+            + rng_mc.normal(0.0, sigma_pct, size=y_fit_base.shape)
+            if USE_MONTE_CARLO else y_fit_base
+        )
+
+        # garantir monotonicidade/duplicatas
+        x_fit, y_fit = make_strictly_increasing_xy(
+            x_fit_base, y_fit, agg="mean"
+        )
+
+        # ----- Splines (em DU) -----
+        y_cs = fit_cubic_spline_eval(x_fit, y_fit, grid_du)
+
+        y_bs = fit_bspline_ridge_eval(
+            x_fit, y_fit, grid_du,
+            n_internal_knots=BS_INTERNAL_KNOTS,
+            degree=BS_DEGREE,
+            ridge=BS_RIDGE
+        )
+
+        # ----- NSS (em anos) -----
+        t_fit = x_fit / 252.0
+        y_nss, _ = fit_nss_bfgs_eval(
+            t_fit, y_fit, grid_t, theta0=None
+        )
+        y_ganss = solver_ga_nss(
+            t_fit, y_fit, grid_t
+        )
+
+        acc_day["CubicSpline"] += y_cs
+        acc_day["B-Spline (Ridge)"] += y_bs
+        acc_day["NSS+L-BFGS-B"] += y_nss
+        acc_day["GA→NSS+L-BFGS-B"] += y_ganss
+
+    # curva média MC do dia
+    for m in metodos:
+        acc_day[m] /= n_sim_eff
+
+    # soma global (média entre dias)
+    for m in metodos:
+        sum_global[m] += acc_day[m]
+        sum2_global[m] += acc_day[m] ** 2
+
+    count_days += 1
+
+    # -----------------------------
+    # guardar valores por dia (DU cutoff e DU targets) para tabelas
+    # -----------------------------
+    rec = {"data": dt.strftime("%Y-%m-%d")}
+
+    # observados
+    rec[f"obs_DU{DU_CUTOFF}"] = _val_at_du_from_grid(y_obs_grid, DU_CUTOFF)
+    for du in DU_TARGETS:
+        rec[f"obs_DU{du}"] = _val_at_du_from_grid(y_obs_grid, du)
+
+    # estimados (média MC do dia)
+    for m in metodos:
+        key = _norm_method_col(m)
+        rec[f"{key}_DU{DU_CUTOFF}"] = _val_at_du_from_grid(acc_day[m], DU_CUTOFF)
+        for du in DU_TARGETS:
+            rec[f"{key}_DU{du}"] = _val_at_du_from_grid(acc_day[m], du)
+
+    daily_records.append(rec)
+
+    # guardar curvas médias por dia (opcional export)
+    if EXPORT_CSV:
+        df_long = pd.DataFrame({
+            "data": dt.strftime("%Y-%m-%d"),
+            "dias_uteis": grid_du.astype(int),
+            "obs_grid": y_obs_grid
+        })
+        for m in metodos:
+            col = _norm_method_col(m)
+            df_long[f"media_mc_{col}"] = acc_day[m]
+        daily_means.append(df_long)
+
+print(f"Dias processados com sucesso: {count_days}")
+
+if count_days == 0:
+    raise RuntimeError("Nenhum dia foi processado. Verifique MIN_POINTS_DAY, DUS e df_curvas.")
+
+# ==========================================================
+# Curvas médias globais + DP entre dias
+# ==========================================================
+mean_global = {m: sum_global[m] / count_days for m in metodos}
+std_between_days = {}
+for m in metodos:
+    ex2 = sum2_global[m] / count_days
+    mu2 = mean_global[m] ** 2
+    std_between_days[m] = np.sqrt(np.maximum(ex2 - mu2, 0.0))
+
+# ==========================================================
+# Curva média OBSERVADA global + DP entre dias
+# ==========================================================
+mean_obs_global = sum_obs_global / count_days
+ex2_obs = sum2_obs_global / count_days
+std_obs_between_days = np.sqrt(np.maximum(ex2_obs - mean_obs_global**2, 0.0))
+
+# ==========================================================
+# DataFrame final (curvas médias globais)
+# ==========================================================
+df_global = pd.DataFrame({"dias_uteis": grid_du.astype(int)})
+df_global["media_global_obs"] = mean_obs_global
+df_global["dp_entre_dias_obs"] = std_obs_between_days
+
+for m in metodos:
+    col = _norm_method_col(m)
+    df_global[f"media_global_{col}"] = mean_global[m]
+    df_global[f"dp_entre_dias_{col}"] = std_between_days[m]
+
+# ==========================================================
+# Export CSVs
+# ==========================================================
+if EXPORT_CSV:
+    df_global.to_csv(
+        f"{OUT_DIR}/curvas_medias_globais_DUmax{DU_MAX}_N{N_SIM}_cut{DU_CUTOFF}.csv",
+        index=False, sep=";", decimal=",", encoding="utf-8-sig"
+    )
+
+    if len(daily_means) > 0:
+        df_daily = pd.concat(daily_means, ignore_index=True)
+        df_daily.to_csv(
+            f"{OUT_DIR}/curvas_medias_por_dia_DUmax{DU_MAX}_N{N_SIM}_cut{DU_CUTOFF}.csv",
+            index=False, sep=";", decimal=",", encoding="utf-8-sig"
+        )
+
+    df_daily_targets = pd.DataFrame(daily_records)
+    df_daily_targets.to_csv(
+        f"{OUT_DIR}/targets_por_dia_N{N_SIM}_cut{DU_CUTOFF}.csv",
+        index=False, sep=";", decimal=",", encoding="utf-8-sig"
+    )
+
+# ==========================================================
+# Plot — curvas médias globais (até DU_MAX)
+# ==========================================================
+plt.figure(figsize=(12, 5))
+plt.plot(grid_du, mean_obs_global, label="Curva OBSERVADA (média global)", linewidth=2)
+for m in metodos:
+    plt.plot(grid_du, mean_global[m], label=m)
+plt.axvline(DU_CUTOFF, color="red", linestyle="--", linewidth=2, label=f"Início extrapolação (DU={DU_CUTOFF})")
+plt.title(f"Curvas médias globais — MC={USE_MONTE_CARLO}, N={N_SIM}, DU≤{DU_MAX} (calibração até {DU_CUTOFF})")
+plt.xlabel("Dias Úteis (DU)")
+plt.ylabel("Taxa 252 (%)")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+if PLOT_SHOW:
+    plt.show()
+
+# ==========================================================
+# 3 TABELAS + 3 GRÁFICOS (DU = 3717, 3969, 5000)
+# ==========================================================
+df_targets = pd.DataFrame(daily_records)
+
+for du_max in DU_TARGETS:
+    rows = []
+    obs_col_cut = f"obs_DU{DU_CUTOFF}"
+    obs_col_du  = f"obs_DU{du_max}"
+
+    # médias globais
+    obs_mean_cut = _val_at_du_from_grid(mean_obs_global, DU_CUTOFF)
+    obs_mean_du  = _val_at_du_from_grid(mean_obs_global, du_max)
+
+    for m in metodos:
+        key = _norm_method_col(m)
+
+        est_col_cut = f"{key}_DU{DU_CUTOFF}"
+        est_col_du  = f"{key}_DU{du_max}"
+
+        # erro por dia no DU alvo
+        err = df_targets[est_col_du] - df_targets[obs_col_du]
+        rmse = float(np.sqrt(np.mean(err**2)))
+        mae  = float(np.mean(np.abs(err)))
+
+        # médias globais
+        est_mean_cut = _val_at_du_from_grid(mean_global[m], DU_CUTOFF)
+        est_mean_du  = _val_at_du_from_grid(mean_global[m], du_max)
+
+        rows.append({
+            "Método": m,
+            f"Est@DU{DU_CUTOFF} (média global)": est_mean_cut,
+            f"Obs@DU{DU_CUTOFF} (média global)": obs_mean_cut,
+            f"Est@DU{du_max} (média global)": est_mean_du,
+            f"Obs@DU{du_max} (média global)": obs_mean_du,
+            "Viés no DU alvo (p.p.)": est_mean_du - obs_mean_du,
+            "RMSE por dia (DU alvo)": rmse,
+            "MAE por dia (DU alvo)": mae
+        })
+
+    df_tab = pd.DataFrame(rows)
+
+    # imprime / exibe
+    print("\n" + "="*110)
+    print(f"TABELA — EXTRAPOLAÇÃO NO DU {du_max} (calibração só até DU {DU_CUTOFF})")
+    print("="*110)
+    try:
+        display(df_tab)
+    except NameError:
+        print(df_tab)
+
+    # salva csv da tabela
+    if EXPORT_CSV:
+        df_tab.to_csv(
+            f"{OUT_DIR}/tabela_extrapolacao_DU{du_max}_cut{DU_CUTOFF}_N{N_SIM}.csv",
+            index=False, sep=";", decimal=",", encoding="utf-8-sig"
+        )
+
+    # --------- GRÁFICO ---------
+    x = np.arange(1, du_max + 1, dtype=int)
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(x, mean_obs_global[:du_max], label="Curva OBSERVADA (média global)", linewidth=2)
+    for m in metodos:
+        plt.plot(x, mean_global[m][:du_max], label=m)
+
+    plt.axvline(DU_CUTOFF, color="red", linestyle="--", linewidth=2, label=f"Início extrapolação (DU={DU_CUTOFF})")
+    plt.title(f"Extrapolação (média global) até DU={du_max} — calibração só até DU={DU_CUTOFF}")
+    plt.xlabel("Dias Úteis (DU)")
+    plt.ylabel("Taxa 252 (%)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    if PLOT_SHOW:
+        plt.show()

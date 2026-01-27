@@ -1,0 +1,205 @@
+# ==========================================================
+# CURVAS MÉDIAS: todas as simulações + todos os dias
+# (i) média MC por dia, (ii) média global entre dias
+# ==========================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ----- CONFIG EXTRA -----
+GRID_MODE = "all_du"   # "all_du" => grid = 1..DU_MAX
+MIN_POINTS_DAY = 60
+EXPORT_CSV = True
+OUT_DIR = "."
+
+# ----- grid comum (necessário para média entre dias) -----
+grid_du = np.arange(1, DU_MAX + 1, dtype=float)
+grid_t = grid_du / 252.0
+
+# RNG do Monte Carlo
+rng_mc = np.random.default_rng(SEED_MC)
+sigma_pct = SIGMA_BP * 0.01  # 1 bp = 0.01 em taxa (%)
+
+metodos = [
+    "CubicSpline",
+    "B-Spline (Ridge)",
+    "NSS+L-BFGS-B",
+    "GA→NSS+L-BFGS-B"
+]
+
+# Acumuladores globais
+sum_global = {m: np.zeros_like(grid_du, dtype=float) for m in metodos}
+sum2_global = {m: np.zeros_like(grid_du, dtype=float) for m in metodos}
+count_days = 0
+
+# (opcional) curvas médias por dia
+daily_means = []
+
+for dt, df_dia in df_curvas.groupby("data_dt"):
+    df_dia = (
+        df_dia.sort_values("dias_uteis")
+              .dropna(subset=["taxa_252"])
+    )
+    if len(df_dia) < MIN_POINTS_DAY:
+        continue
+
+    # ------------------------------------------------------
+    # 41 pontos base
+    # ------------------------------------------------------
+    x_fit_base, y_fit_base = pontos_41_por_dia(df_dia, DUS)
+    if len(x_fit_base) < 8:
+        continue
+
+    # ------------------------------------------------------
+    # GA seed (1x por dia) — CHAMADA CORRIGIDA
+    # ------------------------------------------------------
+    solver_ga_nss, _ = ga_seed_for_nss(
+        x_fit_base / 252.0,   # t_fit (posicional)
+        y_fit_base,           # r_fit (posicional)
+        seed=GA_SEED,
+        pop_size=GA_POP_SIZE,
+        generations=GA_GENER,
+        elite_frac=GA_ELITE_FRAC,
+        mutation_sigma=GA_MUT_SIGMA
+    )
+
+    # acumulador MC do dia
+    acc_day = {m: np.zeros_like(grid_du, dtype=float) for m in metodos}
+    n_sim_eff = N_SIM if USE_MONTE_CARLO else 1
+
+    for _ in range(n_sim_eff):
+        # ruído nos pontos base
+        y_fit = (
+            y_fit_base
+            + rng_mc.normal(0.0, sigma_pct, size=y_fit_base.shape)
+            if USE_MONTE_CARLO else y_fit_base
+        )
+
+        # garantir monotonicidade
+        x_fit, y_fit = make_strictly_increasing_xy(
+            x_fit_base, y_fit, agg="mean"
+        )
+
+        # ----- Splines (em DU) -----
+        y_cs = fit_cubic_spline_eval(x_fit, y_fit, grid_du)
+
+        y_bs = fit_bspline_ridge_eval(
+            x_fit, y_fit, grid_du,
+            n_internal_knots=BS_INTERNAL_KNOTS,
+            degree=BS_DEGREE,
+            ridge=BS_RIDGE
+        )
+
+        # ----- NSS (em anos) -----
+        t_fit = x_fit / 252.0
+
+        y_nss, _ = fit_nss_bfgs_eval(
+            t_fit, y_fit, grid_t, theta0=None
+        )
+
+        y_ganss = solver_ga_nss(
+            t_fit, y_fit, grid_t
+        )
+
+        acc_day["CubicSpline"] += y_cs
+        acc_day["B-Spline (Ridge)"] += y_bs
+        acc_day["NSS+L-BFGS-B"] += y_nss
+        acc_day["GA→NSS+L-BFGS-B"] += y_ganss
+
+    # curva média MC do dia
+    for m in metodos:
+        acc_day[m] /= n_sim_eff
+
+    # soma global (média entre dias)
+    for m in metodos:
+        sum_global[m] += acc_day[m]
+        sum2_global[m] += acc_day[m] ** 2
+
+    count_days += 1
+
+    # guardar curvas médias por dia (opcional)
+    if EXPORT_CSV:
+        df_long = pd.DataFrame({
+            "data": dt.strftime("%Y-%m-%d"),
+            "dias_uteis": grid_du.astype(int)
+        })
+        for m in metodos:
+            col = (
+                m.replace(" ", "_")
+                 .replace("→", "to")
+                 .replace("+", "plus")
+                 .replace("-", "_")
+            )
+            df_long[f"media_mc_{col}"] = acc_day[m]
+        daily_means.append(df_long)
+
+print(f"Dias processados com sucesso: {count_days}")
+
+# ==========================================================
+# Curvas médias globais + DP entre dias
+# ==========================================================
+mean_global = {
+    m: sum_global[m] / max(count_days, 1)
+    for m in metodos
+}
+
+std_between_days = {}
+for m in metodos:
+    ex2 = sum2_global[m] / max(count_days, 1)
+    mu2 = mean_global[m] ** 2
+    std_between_days[m] = np.sqrt(np.maximum(ex2 - mu2, 0.0))
+
+# ==========================================================
+# DataFrame final
+# ==========================================================
+df_global = pd.DataFrame({
+    "dias_uteis": grid_du.astype(int)
+})
+
+for m in metodos:
+    col = (
+        m.replace(" ", "_")
+         .replace("→", "to")
+         .replace("+", "plus")
+         .replace("-", "_")
+    )
+    df_global[f"media_global_{col}"] = mean_global[m]
+    df_global[f"dp_entre_dias_{col}"] = std_between_days[m]
+
+# ==========================================================
+# Export CSVs
+# ==========================================================
+if EXPORT_CSV:
+    df_global.to_csv(
+        f"{OUT_DIR}/curvas_medias_globais_DUmax{DU_MAX}_N{N_SIM}.csv",
+        index=False,
+        sep=";",
+        decimal=",",
+        encoding="utf-8-sig"
+    )
+
+    df_daily = pd.concat(daily_means, ignore_index=True)
+    df_daily.to_csv(
+        f"{OUT_DIR}/curvas_medias_por_dia_DUmax{DU_MAX}_N{N_SIM}.csv",
+        index=False,
+        sep=";",
+        decimal=",",
+        encoding="utf-8-sig"
+    )
+
+# ==========================================================
+# Plot — curvas médias globais
+# ==========================================================
+plt.figure(figsize=(12, 5))
+for m in metodos:
+    plt.plot(grid_du, mean_global[m], label=m)
+
+plt.title(
+    f"Curvas médias globais — MC={USE_MONTE_CARLO}, N={N_SIM}, DU≤{DU_MAX}"
+)
+plt.xlabel("Dias Úteis (DU)")
+plt.ylabel("Taxa 252 (%)")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
