@@ -79,36 +79,64 @@ Para garantir comparabilidade ao longo do tempo, utiliza-se um conjunto fixo de 
 - Avaliação de robustez dos métodos frente a perturbações
 
 
-## Estrutura do repositório (sugestão)
+## Reprodução dos resultados
 
+Os experimentos apresentados no trabalho podem ser reproduzidos a partir dos notebooks e scripts disponibilizados neste repositório. A sequência geral adotada no estudo é descrita a seguir.
 
-Se você preferir manter a estrutura atual, ignore esta seção. Caso queira padronizar:
+### 1. Preparação dos dados
 
+Os arquivos diários da curva pré-fixada são organizados e consolidados em uma base única, contendo:
+- data da curva;
+- eixo de vencimentos em dias úteis (DU);
+- taxas anualizadas no critério 252 dias.
+
+Esse procedimento resulta em uma base balanceada, utilizada em todas as etapas posteriores da análise.
+
+### 2. Seleção dos pontos de ajuste
+
+Define-se um conjunto fixo de 41 pontos de vencimento (DU), comum a todas as datas da amostra.  
+Quando um vencimento exato não está disponível em uma curva diária, utiliza-se o ponto mais próximo observado naquele dia.
+
+### 3. Construção e análise das curvas
+
+A partir da base consolidada:
+- são geradas as curvas diárias;
+- calculam-se estatísticas descritivas por ponto (média, desvio padrão, mínimo e máximo);
+- constroem-se curvas médias mensais e a curva média total do período.
+
+As figuras correspondentes encontram-se na pasta `03 - Imagens`.
+
+### 4. Validação fora da amostra
+
+Para cada data:
+- utiliza-se o conjunto de 41 pontos para ajustar a curva pelos métodos estudados;
+- a curva estimada é comparada com todos os pontos observados naquele dia.
+
+A validação é conduzida por meio de uma divisão treino/teste (70% / 30%) e avaliada com métricas de erro, como RMSE, MAE e MAPE.
+
+### 5. Simulações de Monte Carlo
+
+Com o objetivo de avaliar a robustez dos métodos:
+- adiciona-se ruído (em basis points) aos pontos de ajuste;
+- repete-se o procedimento por múltiplas simulações;
+- analisam-se a distribuição e a variabilidade dos resultados gerados.
+
+---
+
+## Organização do repositório
+
+A estrutura do repositório está organizada da seguinte forma:
 
 ```text
-data/
-  processed/        # bases tratadas (ex.: CSV consolidado)
-notebooks/          # notebooks do projeto
-figures/            # figuras usadas no texto
-src/                # funções reutilizáveis (splines, NSS, métricas)
-results/            # tabelas finais / saídas leves
-Como reproduzir
+01 - Data/
+  ├─ Arquivos antes de virarem um CSV/
+  └─ curva_pre_20251001_20251230.csv
 
-Clonar o repositório
+02 - Notebooks/
+  ├─ Transformação e consolidação dos dados
+  ├─ Estatísticas descritivas
+  ├─ Visualizações
+  └─ Experimentos e validações
 
-git clone https://github.com/LucZamp/TCC-ettj-pre-nss-splines.git
-cd TCC-ettj-pre-nss-splines
-
-Instalar dependências
-
-pip install -r requirements.txt
-
-Executar notebooks na ordem (se aplicável)
-
-01 → 02 → 03 → 04
-
-Autor
-
-Lucas Domingues Zampol
-Graduando em Matemática Aplicada
-Universidade de São Paulo (USP)
+03 - Imagens/
+  └─ Figuras utilizadas no trabalho
