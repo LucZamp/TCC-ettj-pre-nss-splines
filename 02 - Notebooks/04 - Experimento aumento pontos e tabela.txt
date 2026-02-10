@@ -1,0 +1,323 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+from pathlib import Path
+
+from scipy.interpolate import CubicSpline, make_interp_spline
+from scipy.optimize import minimize  # <-- remove differential_evolution
+
+# ============================================================
+# CONFIG
+# ============================================================
+excel_path = "Curva.xlsx"
+sheet_curva = "Plan1"
+sheet_pontos = "Planilha1"
+
+out_dir = Path("ettj_outputs_mc")
+out_dir.mkdir(exist_ok=True)
+
+SEED = 42
+rng = np.random.default_rng(SEED)
+
+n_runs_fast = 10_000
+n_runs_slow = 300
+
+GRID_POINTS = 800
+
+# ============================================================
+# NSS
+# ============================================================
+def nss_zero_rate(t, params):
+    b0, b1, b2, b3, tau1, tau2 = params
+    t = np.maximum(t, 1e-8)
+    x1 = t / tau1
+    x2 = t / tau2
+    term1 = (1 - np.exp(-x1)) / x1
+    term2 = term1 - np.exp(-x1)
+    term3 = (1 - np.exp(-x2)) / x2 - np.exp(-x2)
+    return b0 + b1*term1 + b2*term2 + b3*term3
+
+def predict_nss(params, x_du):
+    return nss_zero_rate(np.asarray(x_du)/252.0, params)
+
+def fit_nss_bfgs(x_du, y, start=None):
+    t = x_du / 252.0
+    y = np.asarray(y, float)
+
+    # z = [b0,b1,b2,b3, log(tau1), log(tau2)]
+    if start is None:
+        start = np.array([y[-1], -1, 1, 1, np.log(1), np.log(3)], float)
+
+    def unpack(z):
+        return np.array([z[0], z[1], z[2], z[3], np.exp(z[4]), np.exp(z[5])], float)
+
+    def obj(z):
+        p = unpack(z)
+        return np.mean((nss_zero_rate(t, p) - y)**2)
+
+    res = minimize(obj, start, method="BFGS", options={"gtol": 1e-10, "maxiter": 5000})
+    return unpack(res.x), res.fun
+
+# ============================================================
+# AG (Genetic Algorithm) para gerar "seed" e depois BFGS
+# ============================================================
+def ga_seed_for_nss_z(x_du, y, seed=42, pop_size=60, generations=120,
+                      elite_frac=0.20, mutation_sigma=0.35):
+    """
+    AG no espaço z = [b0,b1,b2,b3, log(tau1), log(tau2)]
+    Retorna o melhor z encontrado para ser usado como inicialização do BFGS.
+    """
+    rng_local = np.random.default_rng(seed)
+
+    t = np.asarray(x_du, float) / 252.0
+    y = np.asarray(y, float)
+
+    def unpack(z):
+        return np.array([z[0], z[1], z[2], z[3], np.exp(z[4]), np.exp(z[5])], float)
+
+    def loss(z):
+        p = unpack(z)
+        return float(np.mean((nss_zero_rate(t, p) - y)**2))
+
+    # bounds (mesmos limites que você usava no DE)
+    # b0..b3 em [-30,30] (b0 em [0,30]) e logs em [-5,3]
+    lo = np.array([0,   -30, -30, -30, -5, -5], dtype=float)
+    hi = np.array([30,   30,  30,  30,  3,  3], dtype=float)
+
+    # chute base parecido com seu BFGS
+    base = np.array([y[-1], -1, 1, 1, np.log(1), np.log(3)], float)
+    base = np.clip(base, lo, hi)
+
+    # população inicial: base + ruído
+    pop = base + rng_local.normal(0.0, mutation_sigma, size=(pop_size, 6))
+    pop = np.clip(pop, lo, hi)
+
+    elite_n = max(1, int(round(elite_frac * pop_size)))
+
+    for _ in range(generations):
+        scores = np.array([loss(ind) for ind in pop])
+        order = np.argsort(scores)
+        elite = pop[order[:elite_n]]
+
+        # torneio simples
+        def tournament():
+            a, b = rng_local.integers(0, pop_size, size=2)
+            return pop[a] if scores[a] < scores[b] else pop[b]
+
+        children = []
+        while len(children) < (pop_size - elite_n):
+            p1, p2 = tournament(), tournament()
+
+            # crossover aritmético (blend)
+            alpha = rng_local.random()
+            child = alpha * p1 + (1 - alpha) * p2
+
+            # mutação gaussiana
+            child += rng_local.normal(0.0, mutation_sigma, size=6)
+
+            child = np.clip(child, lo, hi)
+            children.append(child)
+
+        pop = np.vstack([elite, np.array(children)])
+
+    scores = np.array([loss(ind) for ind in pop])
+    best = pop[np.argmin(scores)]
+    return best
+
+def fit_nss_ga_bfgs(x_du, y):
+    """
+    Híbrido: AG (global) para achar um bom start, depois BFGS (local) para refinar.
+    """
+    t = x_du / 252.0
+    y = np.asarray(y, float)
+
+    def unpack(z):
+        return np.array([z[0], z[1], z[2], z[3], np.exp(z[4]), np.exp(z[5])], float)
+
+    def obj(z):
+        return np.mean((nss_zero_rate(t, unpack(z)) - y)**2)
+
+    z0 = ga_seed_for_nss_z(x_du, y, seed=SEED, pop_size=60, generations=120,
+                           elite_frac=0.20, mutation_sigma=0.35)
+
+    res = minimize(obj, z0, method="BFGS", options={"gtol": 1e-10, "maxiter": 5000})
+    return unpack(res.x)
+
+# ============================================================
+# MÉTRICAS
+# ============================================================
+def curvature_metric(x, y):
+    dy = np.gradient(y, x)
+    d2y = np.gradient(dy, x)
+    return float(np.mean(np.abs(d2y)))
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+curva = pd.read_excel(excel_path, sheet_name=sheet_curva).rename(
+    columns={"Dias Úteis": "Dias_Uteis", "Preço/Taxa": "Taxa"}
+).sort_values("Dias_Uteis")
+
+pontos = pd.read_excel(excel_path, sheet_name=sheet_pontos).rename(
+    columns={"Dias Uteis": "Dias_Uteis"}
+)
+
+x_real = curva["Dias_Uteis"].to_numpy(float)
+y_real = curva["Taxa"].to_numpy(float)
+
+def taxa_real(du):
+    return np.interp(du, x_real, y_real)
+
+pos_to_du = dict(zip(pontos["Posição"], pontos["Dias_Uteis"]))
+all_pos = sorted(pos_to_du.keys())
+
+# ============================================================
+# MONTE CARLO: sorteio de posições
+# ============================================================
+base_5 = [p for p in [1, 9, 18, 27, 36] if p in all_pos]
+if len(base_5) < 5:
+    base_5 = list(np.round(np.linspace(all_pos[0], all_pos[-1], 5)).astype(int))
+base_5 = sorted(base_5)
+
+def sample_positions(n):
+    if n <= len(base_5):
+        return base_5[:n]
+    remaining = [p for p in all_pos if p not in base_5]
+    add = rng.choice(remaining, size=n - len(base_5), replace=False).tolist()
+    return sorted(base_5 + add)
+
+scenarios = [5, 10, 15, 20, 25, len(all_pos)]
+
+# ============================================================
+# AJUSTE E PREDIÇÃO NA GRADE
+# ============================================================
+def fit_predict_on_grid(method, x_sel, y_sel, x_grid):
+    if method == "Spline":
+        m = CubicSpline(x_sel, y_sel, bc_type="natural", extrapolate=True)
+        return m(x_grid), m
+    if method == "BSpline":
+        k = min(3, len(x_sel) - 1)
+        m = make_interp_spline(x_sel, y_sel, k=k)
+        return m(x_grid), m
+    if method == "NSS_BFGS":
+        p, _ = fit_nss_bfgs(x_sel, y_sel)
+        return predict_nss(p, x_grid), p
+    if method == "NSS_GA_BFGS":  # <-- troca aqui
+        p = fit_nss_ga_bfgs(x_sel, y_sel)
+        return predict_nss(p, x_grid), p
+    raise ValueError("Método inválido")
+
+methods_fast = ["Spline", "BSpline"]
+methods_slow = ["NSS_BFGS", "NSS_GA_BFGS"]  # <-- troca aqui
+
+# ============================================================
+# RODA MONTE CARLO
+# ============================================================
+results_interp = []
+curves_mean = {}
+
+t_global = time.time()
+
+for n in scenarios:
+    pos_tmp = sample_positions(n)
+    x_tmp = np.array([pos_to_du[p] for p in pos_tmp], float)
+    xmin, xmax = float(np.min(x_tmp)), float(np.max(x_tmp))
+    x_grid = np.linspace(xmin, xmax, GRID_POINTS)
+
+    mask = (x_real >= xmin) & (x_real <= xmax)
+    x_cmp = x_real[mask]
+    y_cmp = y_real[mask]
+
+    for method in methods_fast:
+        Y = np.empty((n_runs_fast, len(x_grid)), float)
+        times, mses, curvs = [], [], []
+
+        for i in range(n_runs_fast):
+            pos_list = sample_positions(n)
+            x_sel = np.array([pos_to_du[p] for p in pos_list], float)
+            y_sel = taxa_real(x_sel)
+
+            t0 = time.time()
+            y_hat_grid, _ = fit_predict_on_grid(method, x_sel, y_sel, x_grid)
+            times.append(time.time() - t0)
+
+            y_hat_cmp = np.interp(x_cmp, x_grid, y_hat_grid)
+            mses.append(np.mean((y_hat_cmp - y_cmp) ** 2))
+            curvs.append(curvature_metric(x_grid, y_hat_grid))
+
+            Y[i, :] = y_hat_grid
+
+        curves_mean[(n, method)] = (x_grid, Y.mean(axis=0), Y.std(axis=0))
+
+        results_interp.append({
+            "cenario_n_pontos": n,
+            "metodo": method,
+            "runs": n_runs_fast,
+            "mse_medio": float(np.mean(mses)),
+            "mse_std": float(np.std(mses)),
+            "curvatura_media": float(np.mean(curvs)),
+            "curvatura_std": float(np.std(curvs)),
+            "tempo_medio_s": float(np.mean(times)),
+            "tempo_std_s": float(np.std(times)),
+            "xmin_du": xmin,
+            "xmax_du": xmax
+        })
+
+    for method in methods_slow:
+        Y = np.empty((n_runs_slow, len(x_grid)), float)
+        times, mses, curvs = [], [], []
+
+        for i in range(n_runs_slow):
+            pos_list = sample_positions(n)
+            x_sel = np.array([pos_to_du[p] for p in pos_list], float)
+            y_sel = taxa_real(x_sel)
+
+            t0 = time.time()
+            y_hat_grid, _ = fit_predict_on_grid(method, x_sel, y_sel, x_grid)
+            times.append(time.time() - t0)
+
+            y_hat_cmp = np.interp(x_cmp, x_grid, y_hat_grid)
+            mses.append(np.mean((y_hat_cmp - y_cmp) ** 2))
+            curvs.append(curvature_metric(x_grid, y_hat_grid))
+
+            Y[i, :] = y_hat_grid
+
+        curves_mean[(n, method)] = (x_grid, Y.mean(axis=0), Y.std(axis=0))
+
+        results_interp.append({
+            "cenario_n_pontos": n,
+            "metodo": method,
+            "runs": n_runs_slow,
+            "mse_medio": float(np.mean(mses)),
+            "mse_std": float(np.std(mses)),
+            "curvatura_media": float(np.mean(curvs)),
+            "curvatura_std": float(np.std(curvs)),
+            "tempo_medio_s": float(np.mean(times)),
+            "tempo_std_s": float(np.std(times)),
+            "xmin_du": xmin,
+            "xmax_du": xmax
+        })
+
+    plt.figure(figsize=(11, 5))
+    plt.plot(x_cmp, y_cmp, lw=2, label="Curva B3 (real)")
+
+    for method in methods_fast + methods_slow:
+        xg, m, sdev = curves_mean[(n, method)]
+        plt.plot(xg, m, label=f"{method} (média)")
+        plt.fill_between(xg, m - sdev, m + sdev, alpha=0.15)
+
+    plt.title(f"Interpolação – Monte Carlo (cenário {n} pontos)\nMédia da curva e faixa ±1 desvio padrão")
+    plt.xlabel("Dias úteis")
+    plt.ylabel("Taxa")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / f"interp_mc_{n}.png", dpi=160)
+    plt.close()
+
+df_interp = pd.DataFrame(results_interp).sort_values(["cenario_n_pontos", "metodo"]).reset_index(drop=True)
+df_interp.to_excel(out_dir / "metricas_interpolacao_montecarlo.xlsx", index=False)
+
+print("OK! Arquivos gerados em:", out_dir.resolve())
+print("Tempo total (s):", round(time.time() - t_global, 2))
+display(df_interp.head(12))
